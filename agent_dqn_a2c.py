@@ -8,9 +8,10 @@ from threading import Thread
 from tensorboardX import SummaryWriter
 from envs.Harvest import HarvestGame
 
-# logs_dir = "./logs_0"
+# logs_dir = "./logs/logs_dqna2c"
 # logs_dir = "./logs/logs_dqna2cteam"
-logs_dir = "./logs/logs_dudqna2cfreq"
+# logs_dir = "./logs/logs_da310_128_e4lr"
+logs_dir = "./logs/logs_dqnsingle"
 
 batch_size = 4  # How many experience traces to use for each training step.
 trace_length = 8  # How long each experience trace will be when training
@@ -24,7 +25,7 @@ pre_train_timesteps = 50000  # How many steps of random actions before training 
 max_epLength = 1000  # The max allowed length of our episode.
 load_model = False  # Whether to load a saved model.
 train = True  # Whether to train or test
-models_dir = "./models_duqn"  # The path to save our model to.
+models_dir = "./models_drqn"  # The path to save our model to.
 h_size = 32  # The size of the final hidden layer before splitting it into Advantage and Value streams.
 tau = 0.001  # Rate to update target network toward primary network
 
@@ -41,48 +42,55 @@ action_dim = env.action_dim
 # y = 0.99 # Discount rate.
 # update_frequency = 10 # How many episodes before updating model.
 learning_rate = 1e-4 # Agent learning rate.
-hidden_units = 32 # Number of units in hidden layer.
+hidden_units = 128 #128? # Number of units in hidden layer.
 # model_dir_a2c = "./models_a2c" # The path to save our model to.
 # summary_dir_a2c = "./summaries_a2c" # The path to save our model to.
 
 
-class DQN:
-    def __init__(self, scope, rnn_cell):
+class DQN():
+    def __init__(self, scope):
+        # num_actions = action_dim
         with tf.variable_scope(scope):
-            # The network receives a frame from the game, flattened into an array.
-            self.scalarInput = tf.placeholder(shape=[None, input_h * input_w * 3], dtype=tf.float32)
-            self.fc1 = slim.fully_connected(self.scalarInput, 256)
-            self.trainLength = tf.placeholder(dtype=tf.int32)
-            self.batch_size = tf.placeholder(dtype=tf.int32, shape=[])
-            self.rnn_in = tf.reshape(self.fc1, [self.batch_size, self.trainLength, 256])
-            self.state_in = rnn_cell.zero_state(self.batch_size, tf.float32)
-            # dynamic_rnn returns [output, final_output_state]
-            self.rnn, self.rnn_state = tf.nn.dynamic_rnn(inputs=self.rnn_in, cell=rnn_cell, dtype=tf.float32,
-                                                         initial_state=self.state_in)
-            self.rnn = tf.reshape(self.rnn, shape=[-1, 32])
-            # We take the output from the final convolutional layer and split it into separate advantage and value streams.
-            self.streamA, self.streamV = tf.split(self.rnn, 2, 1)
-            xavier_init = tf.contrib.layers.xavier_initializer()
-            self.AW = tf.Variable(xavier_init([h_size // 2, action_dim]))
-            self.VW = tf.Variable(xavier_init([h_size // 2, 1]))
-            self.Advantage = tf.matmul(self.streamA, self.AW)
-            self.Value = tf.matmul(self.streamV, self.VW)
+            # The network recieves a frame from the game, flattened into an array.
+            # It then resizes it and processes it through four convolutional layers.
+            self.scalarInput = tf.placeholder(shape=[None, input_h, input_w, 3], dtype=tf.float32)
 
-        # #Then combine them together to get our final Q-value function
-        self.Qout = self.Value + tf.subtract(self.Advantage, tf.reduce_mean(self.Advantage, axis=1, keepdims=True))
-        self.predict = tf.argmax(self.Qout, 1)
+            self.conv1 = slim.conv2d(self.scalarInput, 32,
+                                     kernel_size=[3, 3], stride=[2, 2],
+                                     biases_initializer=None,
+                                     activation_fn=tf.nn.elu)
+            self.conv2 = slim.conv2d(self.conv1, 64,
+                                     kernel_size=[3, 3],
+                                     stride=[2, 2],
+                                     biases_initializer=None,
+                                     activation_fn=tf.nn.elu)
 
-        # Below we obtain the loss by taking the sum of squares difference between the target and prediction Q values.
-        self.targetQ = tf.placeholder(shape=[None], dtype=tf.float32)
-        self.actions = tf.placeholder(shape=[None], dtype=tf.int32)
-        self.actions_onehot = tf.one_hot(self.actions, action_dim, dtype=tf.float32)
+            # We take the output from the final convolutional layer
+            # and split it into separate advantage and value streams.
+            self.hidden = slim.fully_connected(slim.flatten(self.conv2),
+                                               hidden_units, activation_fn=tf.nn.elu)
+            self.advantage = slim.fully_connected(self.hidden, action_dim, activation_fn=None,
+                                                  biases_initializer=None)
+            self.value = slim.fully_connected(self.hidden, 1, activation_fn=None,
+                                              biases_initializer=None)
 
-        self.Q = tf.reduce_sum(tf.multiply(self.Qout, self.actions_onehot), axis=1)
+            # Then combine them together to get our final Q-values.
+            self.q_out = self.value + tf.subtract(self.advantage,
+                                                  tf.reduce_mean(self.advantage, axis=1, keep_dims=True))
+            self.predict = tf.argmax(self.q_out, 1)
 
-        self.td_error = tf.square(self.targetQ - self.Q)
-        self.loss = tf.reduce_mean(self.td_error)
-        self.trainer = tf.train.AdamOptimizer(learning_rate)
-        self.updateModel = self.trainer.minimize(self.loss)
+            # Below we obtain the loss by taking the sum of squares difference
+            # between the target and prediction Q values.
+            self.targetQ = tf.placeholder(shape=[None], dtype=tf.float32)
+            self.actions = tf.placeholder(shape=[None], dtype=tf.int32)
+            self.actions_onehot = tf.one_hot(self.actions, action_dim, dtype=tf.float32)
+
+            self.Q = tf.reduce_sum(tf.multiply(self.q_out, self.actions_onehot), axis=1)
+
+            self.td_error = tf.square(self.targetQ - self.Q)
+            self.loss = tf.reduce_mean(self.td_error)
+            self.trainer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+            self.updateModel = self.trainer.minimize(self.loss)
 
 # experience replay: to store episodes and sample then randomly to train the network
 class experience_buffer:
@@ -121,7 +129,7 @@ class A2CAgent:
             self.output = self.out * (0.9) + 0.1 / action_dim
             self.chosen_action = tf.argmax(self.output, 1)
 
-            # The next six lines establish the training proceedure. We feed the reward and chosen action into the network
+            # The next six lines establish the training procedure. We feed the reward and chosen action into the network
             # to compute the loss, and use it to update the network.
             self.reward_holder = tf.placeholder(shape=[None], dtype=tf.float32)
             self.action_holder = tf.placeholder(shape=[None], dtype=tf.int32)
@@ -165,8 +173,8 @@ def updateTargetGraph(from_scope, to_scope):
     target_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, to_scope) #to_scope="agent_" + str(i) + "/target"
     op_holder = []
     for idx, var in enumerate(main_params):
-        op_holder.append(target_params[idx].assign(
-            (var.value() * tau) + (target_params[idx].value() * (1 - tau))))
+        op_holder.append(target_params[idx].assign(var.value()))
+        # op_holder.append(target_params[idx].assign((var.value() * tau) + (target_params[idx].value() * (1 - tau))))
     return op_holder
 
 
@@ -175,18 +183,14 @@ def updateTarget(op_holder):
         sess.run(op)
 
 
-def act(policy, observation, actions_batch, states_batch, idx, ac_type):
-    # choose the action by greedily from the Q-network
-    if (np.random.rand(1) < epsilon or total_steps < pre_train_timesteps) and train:
-        actions_batch[idx] = np.random.randint(0, action_dim)
-        ac_type[idx] = False
+def act_dqn(policy, observation, actions_batch, idx, ac_type):
+    if np.random.rand(1) < epsilon or total_steps < pre_train_timesteps:
+        actions_batch [idx] = np.random.randint(0, action_dim)
+        ac_type [idx] = False
     else:
-
-        a, new_cell_state = sess.run([policy.predict, policy.rnn_state], feed_dict={policy.scalarInput: [observation / 255.0],
-                                  policy.trainLength: 1, policy.state_in: states_batch[idx], policy.batch_size: 1})
-        actions_batch[idx] = a[0]
-        ac_type[idx] = True
-        states_batch[idx] = new_cell_state
+        a = sess.run(policy.predict,feed_dict={policy.scalarInput: np.array([observation / 255.0]).reshape((1,input_h,input_w,3))})
+        actions_batch [idx] = a [0]
+        ac_type [idx] = True
 
 
 def learn(main_policy, target_policy, target_ops, my_buffer, idx):
@@ -196,26 +200,19 @@ def learn(main_policy, target_policy, target_ops, my_buffer, idx):
     trainBatch = my_buffer.sample(batch_size, trace_length)  # Get a random batch of experiences.
     # Below we perform the Double-DQN update to the target Q-values
     Q1 = sess.run(main_policy.predict,
-                  feed_dict={main_policy.scalarInput: np.vstack(trainBatch[:, 3] / 255.0),
-                             main_policy.trainLength: trace_length,
-                             main_policy.state_in: state_train,
-                             main_policy.batch_size: batch_size})
-    Q2 = sess.run(target_policy.Qout,
-                  feed_dict={target_policy.scalarInput: np.vstack(trainBatch[:, 3] / 255.0),
-                             target_policy.trainLength: trace_length,
-                             target_policy.state_in: state_train,
-                             target_policy.batch_size: batch_size})
-    end_multiplier = -(trainBatch[:, 4] - 1)
-    doubleQ = Q2[range(batch_size * trace_length), Q1]
-    targetQ = trainBatch[:, 2] + (gamma * doubleQ * end_multiplier)
+                  feed_dict={main_policy.scalarInput: np.vstack(trainBatch [:, 3] / 255.0).reshape((32,input_h,input_w,3))})
+
+    Q2 = sess.run(target_policy.q_out,
+                  feed_dict={target_policy.scalarInput: np.vstack(trainBatch [:, 3] / 255.0).reshape((32,input_h,input_w,3))})
+    end_multiplier = -(trainBatch [:, 4] - 1)
+    # doubleQ = Q2 [range(batch_size * trace_length), Q1]
+    targetQ = trainBatch [:, 2] + (gamma * Q1 * end_multiplier)
     # Update the network with our target values.
     p_loss, _ = sess.run([main_policy.loss, main_policy.updateModel],
-                         feed_dict={main_policy.scalarInput: np.vstack(trainBatch[:, 0] / 255.0),
+                         feed_dict={main_policy.scalarInput: np.vstack(trainBatch [:, 0] / 255.0).reshape((32,input_h,input_w,3)),
                                     main_policy.targetQ: targetQ,
-                                    main_policy.actions: trainBatch[:, 1],
-                                    main_policy.trainLength: trace_length,
-                                    main_policy.state_in: state_train,
-                                    main_policy.batch_size: batch_size})
+                                    main_policy.actions: trainBatch [:, 1]})
+
     policy_losses[idx] += p_loss
 
 
@@ -253,29 +250,25 @@ if __name__ == '__main__':
     with tf.device("/cpu:0"):
         # how to define the agents
         for i in range(n_agents):
-            if i%2 == 0:
-                cell = tf.contrib.rnn.BasicLSTMCell(num_units=32, state_is_tuple=True)
-                cellT = tf.contrib.rnn.BasicLSTMCell(num_units=32, state_is_tuple=True)
-                agents[str(i)] = {'mainNet': DQN("agent_" + str(i) + "/main", cell),
-                                  'targetNet': DQN("agent_" + str(i) + "/target", cellT),
-                                  'my_buffer': experience_buffer(),
-                                  'episode_buffer': [],
-                                  'targetOps': []}
+            if i%2==0:
+                agents [str(i)] = {'mainNet': DQN("agent_" + str(i) + "/main"),
+                                   'targetNet': DQN("agent_" + str(i) + "/target"),
+                                   'my_buffer': experience_buffer(),
+                                   'episode_buffer': [],
+                                   'targetOps': []}
             else:
-                agents [str(i)] = {'mainNet': A2CAgent("agent_" + str(i) + "/main", hidden_size=h_size),
+                agents [str(i)] = {'mainNet': A2CAgent("agent_" + str(i) + "/main", hidden_size=hidden_units),
                                    'grad_buffer': [],
                                    'my_buffer': experience_buffer(),
                                    'episode_buffer': []}
 
         init = tf.global_variables_initializer()
-        # for i in range(n_agents):
-        #     if i==0:
+        for i in range(n_agents):
+            if i%2==0:
         #         # main_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,scope="agent_" + str(i) + "/main")
         #         # target_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,scope="agent_" + str(i) + "/target")
         #         targetOps = updateTargetGraph("agent_" + str(i)  + "/main", "agent_" + str(i) + "/target")
         #         agents[str(i)]['targetOps'] = targetOps
-        for i in range(n_agents):
-            if i % 2 == 0:
                 targetOps = updateTargetGraph("agent_" + str(i)  + "/main", "agent_" + str(i) + "/target")
                 agents[str(i)]['targetOps'] = targetOps
 
@@ -312,7 +305,7 @@ if __name__ == '__main__':
         sess.run(init)
         # Copy main to target params
         for i in range(n_agents):
-            if i%2 == 0:
+            if i%2==0:
                 updateTarget(agents[str(i)]['targetOps'])
             else:
                 gradBuffer = sess.run(tf.trainable_variables("agent_" + str(i) + "/main"))
@@ -324,7 +317,6 @@ if __name__ == '__main__':
             print('Loading Model...')
             ckpt = tf.train.get_checkpoint_state(models_dir)
             saver.restore(sess, ckpt.model_checkpoint_path)
-
         while total_steps < max_steps:
             for k in range(n_agents):
                 agents[str(k)]['episode_buffer'] = []
@@ -347,8 +339,10 @@ if __name__ == '__main__':
                 # act
                 threads = []
                 for k in range(n_agents):
-                    if k%2 == 0:
-                        thread = Thread(target=act, args=[agents[str(k)]['mainNet'], s[k], acs, cell_states, k, ac_class])
+                    if k%2==0:
+                        thread = Thread(target=act_dqn,
+                                        args=[agents [str(k)] ['mainNet'], s [k], acs, k, ac_class])
+                        # thread = Thread(target=act, args=[agents[str(k)]['mainNet'], s[k], acs, cell_states, k, ac_class])
                         thread.start()
                         threads.append(thread)
                     else:
@@ -383,23 +377,21 @@ if __name__ == '__main__':
                     # learn a2c
                     if d:
                         for i in range(n_agents):
-                            if i % 2 != 0:
-                                myAgent = agents[str(1)]['mainNet']
-                                ep_history = np.array(agents[str(1)]['episode_buffer'])
+                            if i%2 !=0:
+                                myAgent = agents[str(i)]['mainNet']
+                                ep_history = np.array(agents[str(i)]['episode_buffer'])
                                 length = np.shape(ep_history)[0]
-                        # ep_history = agents [str(1)] ['episode_buffer']
+                                # ep_history = agents [str(1)] ['episode_buffer']
                                 ep_history[:,:,2] = discount_rewards(ep_history [:,:,2].reshape(length), gamma).reshape(length,1)
                                 feed_dict = {myAgent.reward_holder: ep_history[:,:,2].reshape(length),
-                                              myAgent.action_holder: ep_history[:,:,1].reshape(length),
-                                              myAgent.state_in: np.vstack(ep_history[:,:,0].tolist()),
-                                              myAgent.batch_size: len(ep_history)}
+                                             myAgent.action_holder: ep_history[:,:,1].reshape(length),
+                                             myAgent.state_in: np.vstack(ep_history[:,:,0].tolist()),
+                                             myAgent.batch_size: len(ep_history)}
                                 v_loss, p_loss, grads = sess.run([myAgent.value_loss,
                                                                   myAgent.policy_loss,
                                                                   myAgent.gradients],
-                                                                  feed_dict=feed_dict)
-                                value_losses[1] += v_loss
-                                policy_losses[1]+= p_loss
-                                update_gradBuffer(agents[str(1)]['grad_buffer'], grads)
+                                                                 feed_dict=feed_dict)
+                                update_gradBuffer(agents[str(i)]['grad_buffer'], grads)
 
                     if epsilon > final_epsilon:
                         epsilon -= stepDrop
@@ -413,9 +405,9 @@ if __name__ == '__main__':
                                                       agents [str(k)] ['my_buffer'], k])
                                 thread.start()
                                 threads.append(thread)
-                    if num_episodes % 10 ==0:
+                    if num_episodes % 10 == 0:
                         for k in range(n_agents):
-                            if k %2 != 0:
+                            if k % 2 != 0:
                                 myAgent = agents[str(k)]['mainNet']
                                 feed_dict = dictionary = dict(zip(myAgent.gradient_holders, agents [str(k)] ['grad_buffer']))
                                 _ = sess.run(myAgent.update_batch, feed_dict=feed_dict)
@@ -453,8 +445,7 @@ if __name__ == '__main__':
 
 
             R = np.sum(r_t, 0)
-            U = np.sum(R)/2
-            # U = np.sum(R)
+            U = np.sum(R)
             if U > 0:
                 E = 1 - 0.5 * np.abs(np.subtract.outer(R, R)).mean() / U
             else:
@@ -482,22 +473,18 @@ if __name__ == '__main__':
                                   total_steps - pre_train_timesteps)
                 individual_rewards = {}
                 losses = {}
-                losses_v = {}
-
+                EPlength = {}
                 for k in range(n_agents):
                     individual_rewards['Agent {}'.format(k)] = np.mean(R_series[-10:], 0)[k]
                     losses['Agent {}'.format(k)] = policy_losses[k] / (
                             total_steps - pre_train_timesteps)
-                    losses_v['Agent {}'.format(k)] = value_losses[k] / (total_steps-pre_train_timesteps)
                     # EPlength['Agent {}'.format(k)] = np.mean(total_length [-10:],0)
                 writer.add_scalars('Individual/Rewards', individual_rewards,
                                    total_steps - pre_train_timesteps)
                 writer.add_scalars('Losses/Policy Loss', losses,
                                    total_steps - pre_train_timesteps)
-                writer.add_scalars('Losses/Value Loss', losses_v,
+                writer.add_scalars('Losses/EPlength', EPlength,
                                    total_steps - pre_train_timesteps)
-                # writer.add_scalars('Losses/EPlength', EPlength,
-                #                    total_steps - pre_train_timesteps)
                 print('------------------STATISTICS------------------')
                 print('Steps so far: {}'.format(total_steps - pre_train_timesteps))
                 print('Epsilon: {}'.format(epsilon))
